@@ -25,3 +25,96 @@
     (set-read-clj! true)
     (is (= :clj-val (load-string "#?(:clj :clj-val :default :other)")))
     (set-read-clj! false)))
+
+(deftest priority-ordering
+  (testing ":lg wins over :default regardless of branch order"
+    (is (= :lg-val #?(:default :default-val :lg :lg-val))))
+
+  (testing ":lg wins over :clj regardless of branch order (clj on)"
+    (set-read-clj! true)
+    (is (= :lg-val (load-string "#?(:clj :clj-val :lg :lg-val)")))
+    (is (= :lg-val (load-string "#?(:lg :lg-val :clj :clj-val)")))
+    (set-read-clj! false))
+
+  (testing ":clj beats :default when clj on, regardless of branch order"
+    (set-read-clj! true)
+    (is (= :clj-val (load-string "#?(:default :default-val :clj :clj-val)")))
+    (is (= :clj-val (load-string "#?(:clj :clj-val :default :default-val)")))
+    (set-read-clj! false))
+
+  (testing ":default still selected when no higher-priority branch matches"
+    (is (= :default-val #?(:cljs :cljs-val :default :default-val)))))
+
+(deftest splicing-priority
+  (testing "splicing #?@ also obeys priority ordering"
+    (is (= [1 2 3 4]
+           [1 #?@(:cljs [99 99] :lg [2 3]) 4]))))
+
+(deftest losing-branch-not-evaluated
+  (testing "un-readable losing branch does not error when a higher-priority branch supersedes it"
+    ;; `::missing-alias/foo` is a namespace-aliased keyword whose alias
+    ;; isn't defined here — reading the value would raise. We rely on
+    ;; the priority loop to text-only-skip it because :lg supersedes it.
+    (is (= :ok (load-string "#?(:default ::missing-alias/foo :lg :ok)")))))
+
+(deftest branch-values-with-reader-macros
+  (testing "quoted list as branch value"
+    (is (= '(1 2) #?(:cljs nil :lg '(1 2)))))
+  (testing "quoted list wins even when written after an un-readable :default"
+    (is (= '(1 2) (load-string "#?(:default ::missing-alias/foo :lg '(1 2))"))))
+  (testing "regex literal as branch value"
+    (let [re #?(:cljs nil :lg #"a+")]
+      (is (= "aaa" (re-find re "aaa")))))
+  (testing "deref'd form as branch value"
+    (let [a (atom 42)]
+      (is (= 42 #?(:cljs nil :lg @a)))))
+  (testing "meta-tagged form as branch value"
+    (let [v #?(:cljs nil :lg ^{:tag :tagged} [1 2])]
+      (is (= [1 2] v))
+      (is (= :tagged (:tag (meta v))))))
+  (testing "nested reader-conditional as branch value"
+    (is (= :inner #?(:cljs nil :lg #?(:cljs nil :lg :inner)))))
+  (testing "tagged literal as branch value"
+    (is (= #uuid "00000000-0000-0000-0000-000000000001"
+           #?(:cljs nil :lg #uuid "00000000-0000-0000-0000-000000000001"))))
+  (testing "char literal containing a closing delimiter inside a delimited branch"
+    ;; `\]` and `\)` inside a vector branch must not prematurely close
+    ;; the skipper's depth counter when capturing the branch.
+    (is (= [\] \) 1] #?(:cljs nil :lg [\] \) 1]))))
+  (testing "line comment containing a closing delimiter inside a delimited branch"
+    (is (= [1 2]
+           #?(:cljs nil
+              :lg [1 ; ]
+                   2]))))
+  (testing "nested reader-conditional whose losing branch contains a stray close-delim"
+    ;; Inner #?(:cljs ]) — the :cljs branch is skipped (no match by
+    ;; default), but its captured text contains ']' which must not be
+    ;; treated as the outer vector's closing delimiter.
+    (is (= [1 2] #?(:cljs nil :lg [1 #?(:cljs ]) 2]))))
+  (testing "form-comment inside a delimited branch"
+    ;; `#_dropped` reads + discards "dropped" from the vector.
+    (is (= [1 2] #?(:cljs nil :lg [1 #_dropped 2]))))
+  (testing "namespaced map literal in a losing branch"
+    ;; let-go doesn't parse #:foo{…} as input, but the skipper must
+    ;; consume it text-only when it lives in a losing branch so a
+    ;; later winning branch still resolves.
+    (is (= :ok (load-string "#?(:cljs #:foo{:bar 1} :lg :ok)")))
+    (is (= :ok (load-string "#?(:cljs #::foo{:bar 1} :lg :ok)")))
+    (is (= :ok (load-string "#?(:cljs #:foo ; trailing\n {:bar 1} :lg :ok)"))))
+  (testing "legacy #^meta syntax in a losing branch"
+    ;; let-go doesn't parse `#^String foo` as input, but the skipper
+    ;; must consume it as meta + target so a later winning branch
+    ;; still resolves.
+    (is (= :ok (load-string "#?(:cljs #^String foo :lg :ok)"))))
+
+(deftest losing-branch-does-not-leak-percent-arity
+  (testing "%n inside a losing branch does not bump the enclosing #() arity"
+    ;; Before the priority fix, `:default %2` would be Read first and
+    ;; bump the outer #() arity even though :lg supersedes it. Since
+    ;; the winner :ok has no %n, the resulting fn is arity 0.
+    (is (= :ok ((load-string "#(do #?(:default %2 :lg :ok))")))))
+
+  (testing "%n inside the winning branch does bump the enclosing #() arity"
+    ;; State from the chosen branch must still propagate so #() arity
+    ;; counts the winner's %n correctly.
+    (is (= :hit ((load-string "#(do #?(:default :other :lg %1))") :hit)))))

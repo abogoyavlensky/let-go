@@ -183,29 +183,38 @@ func (r *NSResolver) Load(name string) *vm.Namespace {
 	if embedded := r.loadEmbedded(name); embedded != nil {
 		return embedded
 	}
-	// Build candidate paths: try .lg and .cljc extensions,
-	// and hyphen vs underscore variants for each path segment.
+	// Build candidate paths: try .lg / .cljc (the let-go-aware
+	// extensions) across every search dir first, and only fall back
+	// to .clj after every dir has been checked. Splitting the passes
+	// preserves prior resolution exactly — a `.clj` in an earlier dir
+	// can no longer steal a name from a `.lg` / `.cljc` in a later dir.
 	hyphenPath := path.Join(blocks...)
 	for i, b := range blocks {
 		blocks[i] = stdstrings.ReplaceAll(b, "-", "_")
 	}
 	underscorePath := path.Join(blocks...)
 
-	candidates := []string{
+	primaryCandidates := []string{
 		hyphenPath + ".lg",
 		underscorePath + ".lg",
 		hyphenPath + ".cljc",
 		underscorePath + ".cljc",
 	}
+	cljCandidates := []string{
+		hyphenPath + ".clj",
+		underscorePath + ".clj",
+	}
 
-	for _, dir := range r.path {
-		for _, candidate := range candidates {
-			cp := path.Join(dir, candidate)
-			if _, err := os.Stat(cp); err == nil {
-				r.cloading[name] = true
-				lns := r.loadFile(cp)
-				delete(r.cloading, name)
-				return lns
+	for _, candidates := range [][]string{primaryCandidates, cljCandidates} {
+		for _, dir := range r.path {
+			for _, candidate := range candidates {
+				cp := path.Join(dir, candidate)
+				if _, err := os.Stat(cp); err == nil {
+					r.cloading[name] = true
+					lns := r.loadFile(cp)
+					delete(r.cloading, name)
+					return lns
+				}
 			}
 		}
 	}

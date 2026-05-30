@@ -82,3 +82,66 @@ func TestReaderConditionalSplicing(t *testing.T) {
 		assert.Equal(t, e, o)
 	}
 }
+
+// TestReaderConditionalWhitespaceAfterPrefix asserts that whitespace
+// between a prefix reader macro and the form it consumes is preserved
+// in the captured snippet, so the re-parsed value's token offsets and
+// FormSource positions remain aligned with the original source.
+func TestReaderConditionalWhitespaceAfterPrefix(t *testing.T) {
+	in := "#?(:lg '\n  :ok :cljs :x)"
+	r := NewLispReaderTokenizing(strings.NewReader(in), "<reader>")
+	_, err := r.Read()
+	assert.NoError(t, err)
+	// Find the token covering ":ok" and confirm it points at the actual
+	// `:ok` in the input rather than a position shifted by the dropped
+	// whitespace.
+	foundOk := false
+	for _, tok := range r.Tokens {
+		if tok.End <= tok.Start || tok.End > len(in) {
+			continue
+		}
+		if in[tok.Start:tok.End] == ":ok" {
+			foundOk = true
+			break
+		}
+	}
+	assert.True(t, foundOk, "expected token spanning the literal :ok in %q; got tokens %+v", in, r.Tokens)
+}
+
+// TestReaderConditionalLeftoverError asserts that when the skipper's
+// captured snippet has unconsumed non-whitespace/non-comment content
+// after sub-reader Read (e.g. `' ;c\n :ok` parses as `(quote VOID)`
+// leaving `:ok` stranded), the conditional surfaces an error instead
+// of silently dropping the trailing text.
+func TestReaderConditionalLeftoverError(t *testing.T) {
+	in := "#?(:lg ' ;c\n :ok)"
+	r := NewLispReader(strings.NewReader(in), "<reader>")
+	_, err := r.Read()
+	assert.Error(t, err, "expected leftover-content error for %q", in)
+}
+
+// TestReaderConditionalTokenOrder pins the REPL-highlighter invariant:
+// after reading a reader-conditional, r.Tokens must be in monotonically
+// non-decreasing Start order, including when the priority-chosen branch
+// is followed by another branch in source.
+func TestReaderConditionalTokenOrder(t *testing.T) {
+	inputs := []string{
+		"#?(:lg :ok :cljs :y)",
+		"#?(:cljs :y :lg :ok)",
+		"#?(:default :first :lg :winner)",
+		"#?(:lg :first :default :second)",
+	}
+	for _, in := range inputs {
+		r := NewLispReaderTokenizing(strings.NewReader(in), "<reader>")
+		_, err := r.Read()
+		assert.NoError(t, err, "input: %s", in)
+		prev := -1
+		for i, tok := range r.Tokens {
+			if tok.Start < prev {
+				t.Errorf("input %q: token %d has Start=%d after a token with Start=%d (order broken)",
+					in, i, tok.Start, prev)
+			}
+			prev = tok.Start
+		}
+	}
+}

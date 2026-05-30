@@ -11,6 +11,7 @@ import (
 	"io"
 	"math"
 	"math/big"
+	"os"
 	"strconv"
 	"strings"
 	"unicode"
@@ -1060,14 +1061,44 @@ const lgConditionalTag = vm.Keyword("lg")
 const cljConditionalTag = vm.Keyword("clj")
 const defaultConditionalTag = vm.Keyword("default")
 
+// Priorities for reader-conditional branch selection. Higher wins.
+// :lg > :clj (when matchCljConditional) > :default; unknown keys
+// score 0 and never match. Picking by priority instead of first-match
+// means branch order in source doesn't change semantics — `:lg` wins
+// even when written after `:clj` or `:default`.
+const (
+	conditionalPriorityNone    = 0
+	conditionalPriorityDefault = 1
+	conditionalPriorityClj     = 2
+	conditionalPriorityLg      = 3
+)
+
+// conditionalPriority returns the selection priority for a reader-
+// conditional platform key. Returns 0 for keys that should not match
+// (including :clj when matchClj is false).
+func conditionalPriority(key vm.Value, matchClj bool) int {
+	switch key {
+	case lgConditionalTag:
+		return conditionalPriorityLg
+	case cljConditionalTag:
+		if matchClj {
+			return conditionalPriorityClj
+		}
+		return conditionalPriorityNone
+	case defaultConditionalTag:
+		return conditionalPriorityDefault
+	}
+	return conditionalPriorityNone
+}
+
 // matchCljConditional controls whether reader conditionals match the :clj
 // branch in addition to :lg and :default. This is opt-in because the
 // :clj branch in many libraries reaches JVM-only code (Long/MAX_VALUE,
 // java.util.UUID, etc.) that fails to compile here. The compat runner
 // (which targets Clojure-the-language) flips this on; the conformance
-// test suite does not. Set via SetMatchCljConditional or the
-// LETGO_READ_CLJ env var at startup.
-var matchCljConditional = false
+// test suite does not. Set via SetMatchCljConditional, set-read-clj! at
+// runtime, or the LG_READ_CLJ env var at startup.
+var matchCljConditional = os.Getenv("LG_READ_CLJ") != ""
 
 // SetMatchCljConditional toggles whether reader conditionals match :clj.
 func SetMatchCljConditional(v bool) { matchCljConditional = v }
@@ -1090,8 +1121,26 @@ func readConditional(r *LispReader, s rune) (vm.Value, error) {
 	}
 
 	// Parse key-value pairs manually so we can skip unreadable branches.
-	var form vm.Value = vm.VOID
-	found := false
+	// We scan every branch and keep the highest-priority match rather than
+	// stopping at the first match — this makes branch order in source
+	// irrelevant (e.g. `#?(:default Z :lg X)` still picks :lg).
+	//
+	// Branches are always SKIPPED (text-only, no Read) on the first pass.
+	// We capture the verbatim text of the current best branch only; after
+	// the loop the captured text is re-parsed in a fresh reader. This
+	// avoids two failure modes the naive "read-when-best-so-far" approach
+	// has: (1) un-readable losing branches (e.g. `::missing/alias`) would
+	// raise during read even though a later higher-priority branch
+	// supersedes them; (2) parseable losing branches would leak reader
+	// state into the surrounding form (e.g. `%n` bumping the enclosing
+	// `#()` arity).
+	var bestText string
+	var bestLine, bestCol, bestPos int
+	// Index in r.Tokens just after the winning key's tokens; sub-reader
+	// tokens for the winner's value will be inserted here so token order
+	// stays monotonic in source position.
+	bestTokenIdx := 0
+	bestPriority := conditionalPriorityNone
 	for {
 		ch, err := r.eatWhitespace()
 		if err != nil {
@@ -1121,24 +1170,68 @@ func readConditional(r *LispReader, s rune) (vm.Value, error) {
 		if err != nil {
 			return vm.NIL, NewReaderError(r, "reading reader conditional key")
 		}
-		isMatch := !found && (key == lgConditionalTag ||
-			(matchCljConditional && key == cljConditionalTag) ||
-			key == defaultConditionalTag)
-		if isMatch {
-			// Read the value form normally
-			val, err := r.Read()
-			if err != nil {
-				return vm.NIL, NewReaderError(r, "reading reader conditional value")
-			}
-			form = val
-			found = true
+		priority := conditionalPriority(key, matchCljConditional)
+		if priority > bestPriority {
+			bestTokenIdx = len(r.Tokens)
+			text, line, col, pos := captureReaderForm(r)
+			bestText, bestLine, bestCol, bestPos = text, line, col, pos
+			bestPriority = priority
 		} else {
-			// Skip the value form — it may contain dialect-specific syntax
-			// we can't parse. Count balanced parens/brackets/braces.
 			skipReaderForm(r)
 		}
 	}
 	r.splicing = splicing
+	if bestPriority == conditionalPriorityNone {
+		return vm.VOID, nil
+	}
+	// Re-parse the winning branch through a sub-reader. Seed it with the
+	// parent's source-position so error messages and FormSource metadata
+	// land on the original file/line/column rather than the snippet's
+	// (line 1, column 1). When the parent is a tokenizing reader (REPL
+	// highlighter), the sub-reader tokenizes too and its tokens are
+	// offset-shifted back into the parent's Tokens slice.
+	var sub *LispReader
+	if r.tokenizing {
+		sub = NewLispReaderTokenizing(strings.NewReader(bestText), r.inputName)
+	} else {
+		sub = NewLispReader(strings.NewReader(bestText), r.inputName)
+	}
+	sub.line = bestLine
+	sub.column = bestCol - 1 // first sub.next() will bump column to bestCol
+	form, err := sub.Read()
+	if err != nil {
+		return vm.NIL, NewReaderError(r, "reading reader conditional value").Wrap(err)
+	}
+	// Defensive: the sub-reader must fully consume the captured snippet
+	// (modulo trailing whitespace/comments). Leftover non-ws/non-comment
+	// content means the skipper's view of "one form" diverged from the
+	// reader's — e.g. a prefix macro followed by a comment leaves the
+	// comment as a VOID form and silently strands later content. Surface
+	// that rather than dropping the trailing text on the floor.
+	if err := assertSubReaderConsumed(sub); err != nil {
+		return vm.NIL, NewReaderError(r, "reader conditional branch value leaves trailing content").Wrap(err)
+	}
+	// Propagate state the winning branch contributes back to the parent:
+	// %n counter for #() arity, and any tokens emitted under tokenizing
+	// mode (offset so they map back to parent-source positions).
+	if sub.maxPercent > r.maxPercent {
+		r.maxPercent = sub.maxPercent
+	}
+	if r.tokenizing && len(sub.Tokens) > 0 {
+		offset := bestPos - 1 // map sub-pos (1-based for first rune) back to parent-pos
+		shifted := make([]Token, len(sub.Tokens))
+		for i, t := range sub.Tokens {
+			t.Start += offset
+			t.End += offset
+			shifted[i] = t
+		}
+		// Insert at bestTokenIdx (right after the winning key's tokens
+		// and before any subsequent keys' / closing-paren tokens). The
+		// REPL highlighter assumes monotonically-increasing Start values
+		// when painting, so appending at the end would mis-paint when
+		// the winner is followed by another branch in source.
+		r.Tokens = append(r.Tokens[:bestTokenIdx], append(shifted, r.Tokens[bestTokenIdx:]...)...)
+	}
 	return form, nil
 }
 
@@ -1146,83 +1239,370 @@ func readConditional(r *LispReader, s rune) (vm.Value, error) {
 // delimiters. Used to skip unmatched reader conditional branches that may
 // contain syntax our reader doesn't support.
 func skipReaderForm(r *LispReader) {
+	skipReaderFormImpl(r, nil)
+}
+
+// assertSubReaderConsumed returns an error if the sub-reader has any
+// non-whitespace, non-line-comment content remaining. Used by the
+// reader-conditional re-parse path to ensure the skipper's notion of
+// "one form" matches what r.Read() actually consumed.
+func assertSubReaderConsumed(sub *LispReader) error {
+	for {
+		c, err := sub.next()
+		if err != nil {
+			// io.EOF (or any read error) — nothing more to inspect.
+			return nil
+		}
+		if isWhitespace(c) {
+			continue
+		}
+		if c == ';' {
+			for c != '\n' && c != '\r' {
+				c, err = sub.next()
+				if err != nil {
+					return nil
+				}
+			}
+			continue
+		}
+		return fmt.Errorf("unexpected trailing rune %q", c)
+	}
+}
+
+// captureReaderForm consumes a single form (like skipReaderForm) and
+// returns its verbatim text along with the line/column/pos of the form's
+// first content rune in the parent reader. Used by reader conditionals
+// so the winning branch can be re-parsed with source positions that
+// point back at the original file.
+func captureReaderForm(r *LispReader) (text string, line, col, pos int) {
+	// Skip leading whitespace + line comments to find the form's first
+	// content rune, snapshot the parent's position at that point, then
+	// unread so skipReaderFormImpl picks the rune up via its own
+	// eat-whitespace logic. Snapshots are taken right after r.next()
+	// returned the rune, so r.line/r.column/r.pos all describe the rune.
 	ch, err := r.eatWhitespace()
 	if err != nil {
-		return
+		return "", 0, 0, 0
 	}
-	// Skip line comments
 	for ch == ';' {
 		for ch != '\n' && ch != '\r' {
 			ch, err = r.next()
 			if err != nil {
-				return
+				return "", 0, 0, 0
 			}
 		}
 		ch, err = r.eatWhitespace()
 		if err != nil {
-			return
+			return "", 0, 0, 0
 		}
 	}
-	switch ch {
-	case '(', '[', '{':
-		close := map[rune]rune{'(': ')', '[': ']', '{': '}'}[ch]
-		depth := 1
-		inString := false
-		for depth > 0 {
-			c, err := r.next()
-			if err != nil {
-				return
-			}
-			if inString {
-				switch c {
-				case '\\':
-					r.next() // skip escaped char
-				case '"':
-					inString = false
-				}
-				continue
-			}
-			switch c {
-			case '"':
-				inString = true
-			case '(', '[', '{':
-				depth++
-			case close:
-				depth--
-			case ')', ']', '}':
-				// closing a different delimiter type — still decrement if matching any open
-				depth--
-			}
+	line, col, pos = r.line, r.column, r.pos
+	if err := r.unread(); err != nil {
+		return "", 0, 0, 0
+	}
+	var buf []rune
+	skipReaderFormImpl(r, &buf)
+	return string(buf), line, col, pos
+}
+
+// skipReaderFormImpl is the shared implementation behind skipReaderForm
+// and captureReaderForm. If capture is non-nil, every consumed rune is
+// appended to it (popping the trailing rune on each unread) so the caller
+// can recover the form's verbatim text. Leading whitespace and line
+// comments are not captured — capture begins at the first content rune,
+// matching the offset r.Read() would treat as the form's start.
+func skipReaderFormImpl(r *LispReader, capture *[]rune) {
+	emit := func(c rune) {
+		if capture != nil {
+			*capture = append(*capture, c)
 		}
-	case '"':
-		// Skip string
-		for {
-			c, err := r.next()
-			if err != nil || c == '"' {
-				return
-			}
-			if c == '\\' {
-				r.next()
-			}
+	}
+	popLast := func() {
+		if capture != nil && len(*capture) > 0 {
+			*capture = (*capture)[:len(*capture)-1]
 		}
-	case '#':
-		// Hash dispatch — skip the next form too
+	}
+	nextR := func() (rune, error) {
+		c, err := r.next()
+		if err == nil {
+			emit(c)
+		}
+		return c, err
+	}
+	unreadR := func() error {
+		popLast()
+		return r.unread()
+	}
+
+	// Eat leading whitespace and line comments, emitting consumed runes
+	// when capturing so prefix-macro recursion preserves the separator
+	// between the macro and the form it consumes. (When capture is nil
+	// this is equivalent to r.eatWhitespace + comment-skip — emit is a
+	// no-op.) Top-level captures don't end up emitting anything here
+	// because captureReaderForm's preamble has already unread() the
+	// first content rune.
+	var ch rune
+	for {
 		c, err := r.next()
 		if err != nil {
 			return
 		}
-		if c == '(' || c == '{' {
-			r.unread()
-			skipReaderForm(r)
-		} else {
-			// #something — skip to whitespace/delimiter
-			for {
-				c, err := r.next()
+		if isWhitespace(c) {
+			emit(c)
+			continue
+		}
+		if c == ';' {
+			emit(c)
+			for c != '\n' && c != '\r' {
+				c, err = r.next()
 				if err != nil {
 					return
 				}
-				if isWhitespace(c) || isTerminatingMacro(c) {
-					r.unread()
+				emit(c)
+			}
+			continue
+		}
+		ch = c
+		break
+	}
+	// First content rune of the form.
+	emit(ch)
+	switch ch {
+	case '(', '[', '{':
+		// Delimited form — read inner forms recursively until the
+		// matching close. We deliberately do NOT do flat bracket
+		// counting: nested forms (including `#?` / `#_` / `"` strings /
+		// `\]` char literals) can contain stray-looking close-delims
+		// that must be consumed by their own form's reader, not by us.
+		// Recursing into skipReaderFormImpl for each inner form keeps
+		// the capture/skip semantics aligned with how readVector etc.
+		// actually parse.
+		close := map[rune]rune{'(': ')', '[': ']', '{': '}'}[ch]
+		for {
+			c, err := r.next()
+			if err != nil {
+				return
+			}
+			if isWhitespace(c) {
+				emit(c)
+				continue
+			}
+			if c == ';' {
+				emit(c)
+				for c != '\n' && c != '\r' {
+					c, err = r.next()
+					if err != nil {
+						return
+					}
+					emit(c)
+				}
+				continue
+			}
+			if c == close {
+				emit(c)
+				return
+			}
+			// Inner form — push c back and let the recursive call read,
+			// emit, and dispatch on it through its own preamble.
+			if err := r.unread(); err != nil {
+				return
+			}
+			skipReaderFormImpl(r, capture)
+		}
+	case '"':
+		skipStringLiteral(nextR)
+	case '\'', '`', '@':
+		// Prefix reader macros that consume one following form.
+		skipReaderFormImpl(r, capture)
+	case '~':
+		// ~ or ~@ — peek for splicing variant, then consume the following form.
+		c, err := nextR()
+		if err != nil {
+			return
+		}
+		if c != '@' {
+			if err := unreadR(); err != nil {
+				return
+			}
+		}
+		skipReaderFormImpl(r, capture)
+	case '^':
+		// ^meta target — two forms.
+		skipReaderFormImpl(r, capture)
+		skipReaderFormImpl(r, capture)
+	case '\\':
+		// Char literal — \x, \space, ሴ etc. Always at least one rune
+		// after the backslash; named chars and unicode escapes continue
+		// as atom-like text until whitespace or a terminating macro.
+		_, err := nextR()
+		if err != nil {
+			return
+		}
+		for {
+			c, err := nextR()
+			if err != nil {
+				return
+			}
+			if isWhitespace(c) || isTerminatingMacro(c) {
+				unreadR()
+				return
+			}
+		}
+	case '#':
+		c, err := nextR()
+		if err != nil {
+			return
+		}
+		switch c {
+		case '(', '{':
+			// #( short-fn or #{ set — re-enter as a delimited form.
+			if err := unreadR(); err != nil {
+				return
+			}
+			skipReaderFormImpl(r, capture)
+		case '"':
+			// #"regex" — string-shaped body.
+			skipStringLiteral(nextR)
+		case '\'':
+			// #'foo — var-quote consumes one following form.
+			skipReaderFormImpl(r, capture)
+		case '_':
+			// #_X — discard the next form (and itself).
+			skipReaderFormImpl(r, capture)
+		case '?':
+			// #?(…) or #?@(…) — reader-conditional. Eat an optional '@'
+			// then re-enter from the leading '(' as a delimited form.
+			c2, err := nextR()
+			if err != nil {
+				return
+			}
+			if c2 != '@' {
+				if err := unreadR(); err != nil {
+					return
+				}
+			}
+			skipReaderFormImpl(r, capture)
+		case '#':
+			// ##symbol — symbolic value, atom-like body.
+			for {
+				cc, err := nextR()
+				if err != nil {
+					return
+				}
+				if isWhitespace(cc) || isTerminatingMacro(cc) {
+					unreadR()
+					return
+				}
+			}
+		case '^':
+			// Legacy Clojure metadata syntax: `#^meta target` —
+			// equivalent to `^meta target`. Two recursions: skip the
+			// meta form, then the target form.
+			skipReaderFormImpl(r, capture)
+			skipReaderFormImpl(r, capture)
+		case ':':
+			// Namespaced map literal: `#:foo{…}`, `#::foo{…}`, or
+			// `#::alias/foo{…}`. Consume the optional second `:` then
+			// the tag name (atom-shaped), then recurse to skip the
+			// map form if one follows. We guard the recurse by peeking
+			// for `{` — a `#:foo` without a trailing map is malformed
+			// input, and recursing blindly could swallow the outer
+			// conditional's closing `)`.
+			cc, err := nextR()
+			if err != nil {
+				return
+			}
+			if cc != ':' {
+				if err := unreadR(); err != nil {
+					return
+				}
+			}
+			for {
+				c2, err := nextR()
+				if err != nil {
+					return
+				}
+				if isWhitespace(c2) || isTerminatingMacro(c2) {
+					if err := unreadR(); err != nil {
+						return
+					}
+					break
+				}
+			}
+			// Peek past any whitespace and line comments for `{`. Don't
+			// emit during the peek — the recursive call's preamble
+			// re-emits whitespace it consumes. Restore the one-rune
+			// unread state after seeing the non-ws/non-`;` char.
+			// (bufio supports only one-rune unread, so any whitespace
+			// or comment runes we peeked over are emitted manually if
+			// we do recurse — keeping the captured snippet aligned.)
+			peeked := []rune{}
+			for {
+				c2, err := r.next()
+				if err != nil {
+					return
+				}
+				if isWhitespace(c2) {
+					peeked = append(peeked, c2)
+					continue
+				}
+				if c2 == ';' {
+					peeked = append(peeked, c2)
+					for c2 != '\n' && c2 != '\r' {
+						c2, err = r.next()
+						if err != nil {
+							return
+						}
+						peeked = append(peeked, c2)
+					}
+					continue
+				}
+				if c2 == '{' {
+					if err := r.unread(); err != nil {
+						return
+					}
+					for _, w := range peeked {
+						emit(w)
+					}
+					skipReaderFormImpl(r, capture)
+					return
+				}
+				// Not a namespaced-map body — push the rune back and
+				// stop. Emit the whitespace/comments we skipped so the
+				// captured snippet stays positionally aligned.
+				if err := r.unread(); err != nil {
+					return
+				}
+				for _, w := range peeked {
+					emit(w)
+				}
+				return
+			}
+		default:
+			if isLetter(c) {
+				// Tagged literal: #tag value — consume the rest of the
+				// tag atom, then recurse to skip the following form.
+				for {
+					cc, err := nextR()
+					if err != nil {
+						return
+					}
+					if isWhitespace(cc) || isTerminatingMacro(cc) {
+						unreadR()
+						break
+					}
+				}
+				skipReaderFormImpl(r, capture)
+				return
+			}
+			// #other — unknown hash dispatch, skip atom-like to delimiter.
+			for {
+				cc, err := nextR()
+				if err != nil {
+					return
+				}
+				if isWhitespace(cc) || isTerminatingMacro(cc) {
+					unreadR()
 					return
 				}
 			}
@@ -1230,14 +1610,30 @@ func skipReaderForm(r *LispReader) {
 	default:
 		// Atom (symbol, number, keyword, etc.) — skip to whitespace/delimiter
 		for {
-			c, err := r.next()
+			c, err := nextR()
 			if err != nil {
 				return
 			}
 			if isWhitespace(c) || isTerminatingMacro(c) {
-				r.unread()
+				unreadR()
 				return
 			}
+		}
+	}
+}
+
+// skipStringLiteral consumes runes until a closing `"`, honoring `\`
+// escapes (the escaped rune is consumed verbatim). Used by both the
+// regular string skip and the `#"regex"` skip; the opening `"` has
+// already been consumed by the caller.
+func skipStringLiteral(nextR func() (rune, error)) {
+	for {
+		c, err := nextR()
+		if err != nil || c == '"' {
+			return
+		}
+		if c == '\\' {
+			nextR()
 		}
 	}
 }
