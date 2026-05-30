@@ -6,6 +6,7 @@
 package vm
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 )
@@ -24,17 +25,25 @@ func (t *theChanType) Box(b any) (Value, error) {
 		return NIL, NewTypeError(b, "is not a channel", t)
 	}
 	rb := make(Chan)
-	go func() {
+	Goroutines.Go(func(ctx context.Context) {
 		for {
 			v, ok := chv.Recv()
 			if !ok {
 				break
 			}
 			bv, _ := BoxValue(v)
-			rb <- bv
+			// Forward-send is cancellable via the registry. (reflect
+			// chv.Recv() above is not ctx-aware, so a cancel won't
+			// interrupt a goroutine blocked waiting on the source Go
+			// channel — only one blocked forwarding a value.)
+			select {
+			case rb <- bv:
+			case <-ctx.Done():
+				return
+			}
 		}
 		close(rb)
-	}()
+	})
 	return Chan(rb), nil
 }
 

@@ -11,6 +11,7 @@
 package rt
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"sync"
@@ -36,6 +37,112 @@ type Pub struct {
 
 func init() { RegisterInstaller(installAsyncNS) }
 
+// PromiseChan implements clojure.core.async's promise-chan: a channel
+// that caches the FIRST value put to it and replays that value to every
+// taker, forever. Subsequent puts are dropped; closing without a value
+// makes takers receive nil; closing after a value is a no-op (the value
+// keeps being served).
+//
+// Unlike a raw vm.Chan it STORES the value rather than transferring it,
+// which is what makes the semantics correct: with a single raw channel a
+// taker parked before the first put could steal that put before it was
+// cached, so later takers would never see it. Storing the value behind a
+// latch removes that race entirely.
+//
+// Dispatched to by >! / <! / close! when they receive a boxed
+// *PromiseChan instead of a vm.Chan. Methods are unexported so the
+// reflective method-boxing in vm.NewBoxed skips them.
+type PromiseChan struct {
+	mu     sync.Mutex
+	value  vm.Value
+	set    bool
+	closed bool
+	ready  chan struct{} // closed once set or closed; latch for takers
+}
+
+func newPromiseChan() *PromiseChan {
+	return &PromiseChan{value: vm.NIL, ready: make(chan struct{})}
+}
+
+// put caches v if no value has been delivered and the chan is open;
+// otherwise it is dropped (first put wins).
+func (p *PromiseChan) put(v vm.Value) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.set || p.closed {
+		return
+	}
+	p.value = v
+	p.set = true
+	close(p.ready)
+}
+
+// take returns the cached value, blocking until one is delivered or the
+// chan is closed. ctx (the registry context) lets a blocked take be
+// drained on shutdown; cancellation returns nil.
+func (p *PromiseChan) take(ctx context.Context) vm.Value {
+	p.mu.Lock()
+	if p.set || p.closed {
+		v := p.value
+		p.mu.Unlock()
+		return v
+	}
+	p.mu.Unlock()
+	select {
+	case <-p.ready:
+	case <-ctx.Done():
+		return vm.NIL
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.value // the delivered value, or NIL if closed empty
+}
+
+// doClose marks the chan closed. No-op once a value is set, so the value
+// keeps being served to takers.
+func (p *PromiseChan) doClose() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.set || p.closed {
+		return
+	}
+	p.closed = true
+	close(p.ready)
+}
+
+// asPromiseChan returns the *PromiseChan a value wraps, if any.
+func asPromiseChan(v vm.Value) (*PromiseChan, bool) {
+	b, ok := v.(*vm.Boxed)
+	if !ok {
+		return nil, false
+	}
+	pc, ok := b.Unbox().(*PromiseChan)
+	return pc, ok
+}
+
+// ctxSend sends v on ch, aborting if ctx is cancelled (e.g. a registry
+// Drain on shutdown / between bench iterations). Returns false if the
+// send was abandoned due to cancellation.
+func ctxSend(ctx context.Context, ch vm.Chan, v vm.Value) bool {
+	select {
+	case ch <- v:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// ctxRecv receives from ch. ok is false when ch is closed; live is false
+// when ctx was cancelled before a value arrived (caller should return).
+func ctxRecv(ctx context.Context, ch vm.Chan) (v vm.Value, ok bool, live bool) {
+	select {
+	case rv, rok := <-ch:
+		return rv, rok, true
+	case <-ctx.Done():
+		return vm.NIL, false, false
+	}
+}
+
 // nolint
 func installAsyncNS() {
 	// Look up the core builtins to re-export
@@ -45,6 +152,10 @@ func installAsyncNS() {
 	closeChan, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
 		if len(vs) != 1 {
 			return vm.NIL, fmt.Errorf("close! expects 1 arg")
+		}
+		if pc, ok := asPromiseChan(vs[0]); ok {
+			pc.doClose()
+			return vm.NIL, nil
 		}
 		ch, ok := vs[0].(vm.Chan)
 		if !ok {
@@ -76,10 +187,15 @@ func installAsyncNS() {
 			return vm.NIL, fmt.Errorf("timeout expected Int milliseconds")
 		}
 		ch := make(vm.Chan)
-		go func() {
-			time.Sleep(time.Duration(int(ms)) * time.Millisecond)
+		vm.Goroutines.Go(func(ctx context.Context) {
+			t := time.NewTimer(time.Duration(int(ms)) * time.Millisecond)
+			defer t.Stop()
+			select {
+			case <-t.C:
+			case <-ctx.Done():
+			}
 			close(ch)
-		}()
+		})
 		return ch, nil
 	})
 
@@ -101,14 +217,23 @@ func installAsyncNS() {
 		if len(vs) == 3 {
 			shouldClose = vm.IsTruthy(vs[2])
 		}
-		go func() {
-			for v := range src {
-				dst <- v
+		vm.Goroutines.Go(func(ctx context.Context) {
+			for {
+				v, ok, live := ctxRecv(ctx, src)
+				if !live {
+					return
+				}
+				if !ok {
+					break
+				}
+				if !ctxSend(ctx, dst, v) {
+					return
+				}
 			}
 			if shouldClose {
 				close(dst)
 			}
-		}()
+		})
 		return dst, nil
 	})
 
@@ -130,14 +255,16 @@ func installAsyncNS() {
 		if !ok {
 			return vm.NIL, fmt.Errorf("onto-chan! expected Sequable")
 		}
-		go func() {
+		vm.Goroutines.Go(func(ctx context.Context) {
 			for s := seq.Seq(); s != nil; s = s.Next() {
-				ch <- s.First()
+				if !ctxSend(ctx, ch, s.First()) {
+					return
+				}
 			}
 			if shouldClose {
 				close(ch)
 			}
-		}()
+		})
 		return ch, nil
 	})
 
@@ -167,20 +294,37 @@ func installAsyncNS() {
 				continue
 			}
 			count++
-			go func(c vm.Chan) {
-				for v := range c {
-					out <- v
+			c := ch
+			vm.Goroutines.Go(func(ctx context.Context) {
+				for {
+					v, ok, live := ctxRecv(ctx, c)
+					if !live {
+						return
+					}
+					if !ok {
+						break
+					}
+					if !ctxSend(ctx, out, v) {
+						return
+					}
 				}
-				done <- struct{}{}
-			}(ch)
+				select {
+				case done <- struct{}{}:
+				case <-ctx.Done():
+				}
+			})
 		}
 		// Close output when all inputs are done
-		go func() {
+		vm.Goroutines.Go(func(ctx context.Context) {
 			for range count {
-				<-done
+				select {
+				case <-done:
+				case <-ctx.Done():
+					return
+				}
 			}
 			close(out)
-		}()
+		})
 		return out, nil
 	})
 
@@ -199,18 +343,25 @@ func installAsyncNS() {
 			return vm.NIL, fmt.Errorf("async/reduce expected Chan")
 		}
 		out := make(vm.Chan, 1)
-		go func() {
+		vm.Goroutines.Go(func(ctx context.Context) {
 			acc := init
-			for v := range ch {
+			for {
+				v, ok, live := ctxRecv(ctx, ch)
+				if !live {
+					return
+				}
+				if !ok {
+					break
+				}
 				result, err := fn.Invoke([]vm.Value{acc, v})
 				if err != nil {
 					break
 				}
 				acc = result
 			}
-			out <- acc
+			out <- acc // out is buffered (cap 1); never blocks
 			close(out)
-		}()
+		})
 		return out, nil
 	})
 
@@ -225,16 +376,23 @@ func installAsyncNS() {
 			return vm.NIL, fmt.Errorf("async/into expected Chan")
 		}
 		out := make(vm.Chan, 1)
-		go func() {
+		vm.Goroutines.Go(func(ctx context.Context) {
 			acc := coll
-			for v := range ch {
+			for {
+				v, ok, live := ctxRecv(ctx, ch)
+				if !live {
+					return
+				}
+				if !ok {
+					break
+				}
 				if assoc, ok := acc.(vm.Collection); ok {
 					acc = assoc.Conj(v)
 				}
 			}
-			out <- acc
+			out <- acc // out is buffered (cap 1); never blocks
 			close(out)
-		}()
+		})
 		return out, nil
 	})
 
@@ -248,12 +406,14 @@ func installAsyncNS() {
 			return vm.NIL, fmt.Errorf("to-chan! expected Sequable")
 		}
 		ch := make(vm.Chan)
-		go func() {
+		vm.Goroutines.Go(func(ctx context.Context) {
 			for s := seq.Seq(); s != nil; s = s.Next() {
-				ch <- s.First()
+				if !ctxSend(ctx, ch, s.First()) {
+					return
+				}
 			}
 			close(ch)
-		}()
+		})
 		return ch, nil
 	})
 
@@ -312,7 +472,20 @@ func installAsyncNS() {
 			return vm.NIL, fmt.Errorf("alts! requires at least one port")
 		}
 
+		// Append a recv on the registry context's Done channel so an
+		// alts! parked on its ports — e.g. inside a (go ...) block — is
+		// released by a CancelAll/Drain on shutdown. If that case wins,
+		// return nil (no port chosen).
+		cancelIdx := len(cases)
+		cases = append(cases, reflect.SelectCase{
+			Dir:  reflect.SelectRecv,
+			Chan: reflect.ValueOf(vm.CurrentContext().Done()),
+		})
+
 		chosen, value, ok := reflect.Select(cases)
+		if chosen == cancelIdx {
+			return vm.NIL, nil
+		}
 		port := ports[chosen]
 
 		var result vm.Value
@@ -367,56 +540,15 @@ func installAsyncNS() {
 		}
 	})
 
-	// promise-chan — channel that caches and replays one value to all takers
+	// promise-chan — a channel that caches the first value put and
+	// replays it to every taker (see PromiseChan). Returned boxed; >! /
+	// <! / close! dispatch to it. No goroutine needed — the value is
+	// stored behind a latch, so there is no parked-taker steal race.
 	promiseChan, _ := vm.NativeFnType.Wrap(func(vs []vm.Value) (vm.Value, error) {
-		ch := make(vm.Chan)
-		p := vm.NewPromise()
-		// Deliver goroutine: first put delivers, then replay forever
-		go func() {
-			v, ok := <-ch
-			if ok {
-				p.Deliver(v)
-			} else {
-				p.Deliver(vm.NIL)
-			}
-		}()
-		// Wrap in a boxed value that acts like a channel but reads from promise
-		// Simpler approach: return a special channel that replays
-		out := make(vm.Chan)
-		go func() {
-			// Wait for the value
-			val := p.Deref()
-			// Now replay it to anyone who reads
-			for {
-				out <- val
-			}
-		}()
-		// We need both ends: write to ch, read from out
-		// Package them together. Actually, simplest: use a proxy channel
-		proxy := make(vm.Chan)
-		delivered := make(chan struct{}, 1)
-		var cached vm.Value
-		go func() {
-			// First value written becomes the cached value
-			v, ok := <-proxy
-			if ok {
-				cached = v
-			} else {
-				cached = vm.NIL
-			}
-			close(delivered)
-		}()
-		go func() {
-			<-delivered
-			// Now serve reads forever
-			for {
-				proxy <- cached
-			}
-		}()
-		// Close the unused channels
-		close(ch)
-		close(out)
-		return proxy, nil
+		if len(vs) != 0 {
+			return vm.NIL, fmt.Errorf("promise-chan expects 0 args")
+		}
+		return vm.NewBoxed(newPromiseChan()), nil
 	})
 
 	// mult — create a mult (broadcast) from a source channel
@@ -429,8 +561,15 @@ func installAsyncNS() {
 			return vm.NIL, fmt.Errorf("mult expected Chan")
 		}
 		m := &Mult{src: src, taps: make(map[vm.Chan]bool)}
-		go func() {
-			for v := range src {
+		vm.Goroutines.Go(func(ctx context.Context) {
+			for {
+				v, ok, live := ctxRecv(ctx, src)
+				if !live {
+					return
+				}
+				if !ok {
+					break
+				}
 				m.mu.Lock()
 				for ch, closeCh := range m.taps {
 					select {
@@ -450,7 +589,7 @@ func installAsyncNS() {
 				}
 			}
 			m.mu.Unlock()
-		}()
+		})
 		return vm.NewBoxed(m), nil
 	})
 
@@ -537,8 +676,15 @@ func installAsyncNS() {
 			return vm.NIL, fmt.Errorf("pub expected Fn")
 		}
 		p := &Pub{src: src, topicFn: topicFn, subs: make(map[any]vm.Chan)}
-		go func() {
-			for v := range src {
+		vm.Goroutines.Go(func(ctx context.Context) {
+			for {
+				v, ok, live := ctxRecv(ctx, src)
+				if !live {
+					return
+				}
+				if !ok {
+					break
+				}
 				topic, err := topicFn.Invoke([]vm.Value{v})
 				if err != nil {
 					continue
@@ -559,7 +705,7 @@ func installAsyncNS() {
 				close(ch)
 			}
 			p.mu.Unlock()
-		}()
+		})
 		return vm.NewBoxed(p), nil
 	})
 
@@ -622,18 +768,29 @@ func installAsyncNS() {
 		}
 		trueCh := make(vm.Chan)
 		falseCh := make(vm.Chan)
-		go func() {
-			for v := range src {
+		vm.Goroutines.Go(func(ctx context.Context) {
+			for {
+				v, ok, live := ctxRecv(ctx, src)
+				if !live {
+					return
+				}
+				if !ok {
+					break
+				}
 				result, err := pred.Invoke([]vm.Value{v})
 				if err != nil || !vm.IsTruthy(result) {
-					falseCh <- v
+					if !ctxSend(ctx, falseCh, v) {
+						return
+					}
 				} else {
-					trueCh <- v
+					if !ctxSend(ctx, trueCh, v) {
+						return
+					}
 				}
 			}
 			close(trueCh)
 			close(falseCh)
-		}()
+		})
 		return vm.NewArrayVector([]vm.Value{trueCh, falseCh}), nil
 	})
 
@@ -659,12 +816,15 @@ func installAsyncNS() {
 			chs = append(chs, ch)
 		}
 		out := make(vm.Chan)
-		go func() {
+		vm.Goroutines.Go(func(ctx context.Context) {
 			for {
 				args := make([]vm.Value, len(chs))
 				allOk := true
 				for i, ch := range chs {
-					v, ok := <-ch
+					v, ok, live := ctxRecv(ctx, ch)
+					if !live {
+						return
+					}
 					if !ok {
 						allOk = false
 						break
@@ -678,10 +838,12 @@ func installAsyncNS() {
 				if err != nil {
 					break
 				}
-				out <- result
+				if !ctxSend(ctx, out, result) {
+					return
+				}
 			}
 			close(out)
-		}()
+		})
 		return out, nil
 	})
 
@@ -699,17 +861,22 @@ func installAsyncNS() {
 			return vm.NIL, fmt.Errorf("async/take expected Chan")
 		}
 		out := make(vm.Chan)
-		go func() {
+		vm.Goroutines.Go(func(ctx context.Context) {
 			count := int(n)
 			for range count {
-				v, ok := <-ch
+				v, ok, live := ctxRecv(ctx, ch)
+				if !live {
+					return
+				}
 				if !ok {
 					break
 				}
-				out <- v
+				if !ctxSend(ctx, out, v) {
+					return
+				}
 			}
 			close(out)
-		}()
+		})
 		return out, nil
 	})
 

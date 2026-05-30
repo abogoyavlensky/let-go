@@ -2084,6 +2084,17 @@
            (finally
              (close! ~name)))))))
 
+(def ^:dynamic *scope-drain-timeout-ms* 5000)
+
+(defmacro with-scope
+  [bindings & body]
+  (let [name (first bindings)]
+    `(let [~name (scope-open)]
+       (try
+         ~@body
+         (finally
+           (scope-close! ~name *scope-drain-timeout-ms*))))))
+
 (defn replace
   [smap coll]
   (if (vector? coll)

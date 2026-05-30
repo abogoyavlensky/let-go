@@ -179,3 +179,26 @@ func (f *formSourceMap) Get(form Value) *SourceInfo {
 	f.mu.RUnlock()
 	return info
 }
+
+// Len reports how many form→SourceInfo entries are currently held.
+func (f *formSourceMap) Len() int {
+	f.mu.RLock()
+	n := len(f.m)
+	f.mu.RUnlock()
+	return n
+}
+
+// Reset drops all form→SourceInfo entries. This map is keyed by form
+// object identity and never evicts, so a process that compiles many
+// distinct forms over time (e.g. BenchmarkClojureTestSuite re-running
+// the whole suite per iteration) accumulates an entry — and a live
+// reference pinning the *List/*Cons form — for every form ever read.
+// Callers that re-compile in a loop should Reset between rounds to keep
+// the map (and the forms it pins) from growing unboundedly. Safe to call
+// between compiles; source info for the current compile is repopulated
+// as forms are read.
+func (f *formSourceMap) Reset() {
+	f.mu.Lock()
+	f.m = map[any]*SourceInfo{}
+	f.mu.Unlock()
+}
