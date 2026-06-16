@@ -5,6 +5,7 @@ go 1.26
 require (
 	github.com/chzyer/readline v0.0.0-20180603132655-2972be24d48e
 	github.com/stretchr/testify v1.8.4
+	github.com/tetratelabs/wazero v1.12.0
 	github.com/zeebo/xxh3 v1.1.0
 	golang.org/x/perf v0.0.0-20260512194132-3cf34090a3db
 )
