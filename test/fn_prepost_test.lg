@@ -22,6 +22,17 @@
       (is (= 1 (f)))
       (is (= 1 @calls)))))
 
+(deftest generated-condition-forms-are-hygienic
+  (testing "locals named after generated core forms do not capture them"
+    (is (= :caught
+           (try ((fn [assert x] {:post [(pos? %)]} x) identity 0)
+                (catch e :caught))))
+    (is (= 1 ((fn [let x] {:post [(pos? %)]} x) identity 1)))))
+
+(deftest explicit-percent-one-remains-a-user-local
+  (testing "%1 stays distinct from the postcondition result binding %"
+    (is (= 0 ((fn [%1] {:post [(= %1 5)]} 0) 5)))))
+
 (deftest conditions-see-destructured-locals
   (testing "conditions run inside parameter destructuring"
     (let [f (fn [{:keys [x]}]

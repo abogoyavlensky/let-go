@@ -40,6 +40,8 @@ After changing `pkg/rt/core/core.lg`, regenerate the runtime bundle before runni
 
 > Deviation: Treat a leading map as a condition map only when another body form follows it. A lone map is the function's return value, matching Clojure and preserving existing map-returning functions.
 
+> Deviation: Codex review found that unqualified generated forms could be captured and the reader conflated `%` with `%1`. Qualify generated core macros and restrict `%` shorthand translation to `#(...)` so postconditions remain hygienic.
+
 **Files:**
 - Modify: `pkg/rt/core/core.lg`
 - Test: `test/fn_prepost_test.lg`
@@ -59,7 +61,7 @@ After changing `pkg/rt/core/core.lg`, regenerate the runtime bundle before runni
   Run: `go test ./test -count=1`
   Expected: PASS.
 
-- [ ] **Step 5: Commit the implementation**
+- [x] **Step 5: Commit the implementation**
   Run: `git add pkg/rt/core/core.lg test/fn_prepost_test.lg pkg/rt/generated.sums pkg/rt/core.lgb && git commit -m "fix(core): support function pre and postconditions"`
   If `make generate` changes a different tracked generated-file set, stage that exact set instead of assuming both generated paths above exist.
 
