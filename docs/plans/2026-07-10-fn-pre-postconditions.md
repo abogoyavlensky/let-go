@@ -29,31 +29,33 @@ After changing `pkg/rt/core/core.lg`, regenerate the runtime bundle before runni
 **Files:**
 - Create: `test/fn_prepost_test.lg`
 
-- [ ] **Step 1: Write focused condition tests**
+- [x] **Step 1: Write focused condition tests**
   Add tests for a passing precondition, a failing precondition, a passing postcondition that uses `%`, a failing postcondition, a side-effecting body evaluated once, destructured argument locals in conditions, multi-arity conditions, and an ordinary function without a condition map.
 
-- [ ] **Step 2: Run the focused test and verify failure**
+- [x] **Step 2: Run the focused test and verify failure**
   Run: `go test ./test -run 'TestRunner/fn_prepost_test.lg' -count=1 -v`
   Expected: FAIL while compiling the test, with `%` reported as unresolved or condition maps treated as executable values.
 
 ### Task 2: Implement condition expansion
 
+> Deviation: Treat a leading map as a condition map only when another body form follows it. A lone map is the function's return value, matching Clojure and preserving existing map-returning functions.
+
 **Files:**
 - Modify: `pkg/rt/core/core.lg`
 - Test: `test/fn_prepost_test.lg`
 
-- [ ] **Step 1: Expand the condition map in `fn-expand`**
+- [x] **Step 1: Expand the condition map in `fn-expand`**
   Detect a leading map in the arity body. Convert each `:pre` expression to an `assert` before the user body. When `:post` is present, wrap the user body in a single `let` binding named `%`, append one `assert` per postcondition, and return `%`. Feed that expanded body into the existing destructuring and keyword-argument paths so conditions see destructured locals.
 
-- [ ] **Step 2: Regenerate the runtime bundle**
+- [x] **Step 2: Regenerate the runtime bundle**
   Run: `make generate`
   Expected: PASS and generated stdlib artifacts updated to match `pkg/rt/core/core.lg`.
 
-- [ ] **Step 3: Run the focused test**
+- [x] **Step 3: Run the focused test**
   Run: `go test ./test -run 'TestRunner/fn_prepost_test.lg' -count=1 -v`
   Expected: PASS.
 
-- [ ] **Step 4: Run the core test package**
+- [x] **Step 4: Run the core test package**
   Run: `go test ./test -count=1`
   Expected: PASS.
 

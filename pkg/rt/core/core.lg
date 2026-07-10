@@ -835,7 +835,19 @@
     `(def ~(def-meta-name name doc attr) (fn ~@forms))))
 
 (defn ^:private fn-expand [bindings body]
-  (let [amp-idx (loop [i 0 bs (seq bindings)]
+  (let [conditions (when (and (next body) (map? (first body))) (first body))
+        body (if conditions (next body) body)
+        ;; The reader represents source-level % as %1. Bind that internal
+        ;; symbol so postconditions see the function's result as Clojure's %.
+        result-sym (symbol "%1")
+        body (if (:post conditions)
+               (list (cons 'let
+                           (cons (vector result-sym (cons 'do body))
+                                 (concat (map #(list 'assert %) (:post conditions))
+                                         (list result-sym)))))
+               body)
+        body (concat (map #(list 'assert %) (:pre conditions)) body)
+        amp-idx (loop [i 0 bs (seq bindings)]
                   (if bs
                     (if (= (first bs) '&) i (recur (inc i) (next bs)))
                     -1))
