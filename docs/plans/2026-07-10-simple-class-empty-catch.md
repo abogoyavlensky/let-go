@@ -35,6 +35,8 @@ Tests will cover empty-body `Throwable` and `Exception` clauses, the existing qu
 
 ### Task 2: Extend catch disambiguation
 
+> Deviation: Codex review found a second catch parser in `pkg/rt/core/ir/build.lg`. Apply the same class-shape rule there and add native Go lowering coverage so bytecode and AOT agree.
+
 **Files:**
 - Modify: `pkg/compiler/compiler.go`
 - Test: `test/catch_class_test.lg`
