@@ -26,10 +26,10 @@ Tests will cover empty-body `Throwable` and `Exception` clauses, the existing qu
 **Files:**
 - Modify: `test/catch_class_test.lg`
 
-- [ ] **Step 1: Add simple-class empty-body tests**
+- [x] **Step 1: Add simple-class empty-body tests**
   Assert that `(catch Throwable _)` and `(catch Exception _)` catch a thrown value and return `nil`. Retain coverage for a qualified class, a simple class with a body, and `(catch e :ok)`.
 
-- [ ] **Step 2: Run the focused test and verify failure**
+- [x] **Step 2: Run the focused test and verify failure**
   Run: `go test ./test -run 'TestRunner/catch_class_test.lg' -count=1 -v`
   Expected: FAIL while compiling the new cases with `Can't resolve _ in this context`.
 
@@ -39,18 +39,18 @@ Tests will cover empty-body `Throwable` and `Exception` clauses, the existing qu
 - Modify: `pkg/compiler/compiler.go`
 - Test: `test/catch_class_test.lg`
 
-- [ ] **Step 1: Recognize uppercase simple class symbols**
+- [x] **Step 1: Recognize uppercase simple class symbols**
   In the two-token `class + binding` case, classify the first token as a class when its first rune is uppercase. Keep the existing qualified/dotted and token-count rules. Keep lowercase two-token clauses on the legacy `binding + body` path.
 
-- [ ] **Step 2: Run the focused test**
+- [x] **Step 2: Run the focused test**
   Run: `go test ./test -run 'TestRunner/catch_class_test.lg' -count=1 -v`
   Expected: PASS.
 
-- [ ] **Step 3: Run compiler and core tests**
+- [x] **Step 3: Run compiler and core tests**
   Run: `go test ./pkg/compiler ./test -count=1`
   Expected: PASS.
 
-- [ ] **Step 4: Commit the compiler fix**
+- [x] **Step 4: Commit the compiler fix**
   Run: `git add pkg/compiler/compiler.go test/catch_class_test.lg docs/plans/2026-07-10-simple-class-empty-catch.md && git commit -m "fix(compiler): parse empty simple-class catches"`
   Expected: one focused commit containing the implementation, tests, and checked plan steps.
 
