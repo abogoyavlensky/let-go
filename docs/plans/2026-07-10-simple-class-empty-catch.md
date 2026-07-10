@@ -1,5 +1,7 @@
 # Simple-Class Empty Catch Implementation Plan
 
+**Status:** Completed 2026-07-10
+
 > **For agentic workers:** Use executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Parse Clojure catch clauses such as `(catch Throwable _)` as a simple class, binding, and empty body while preserving let-go's legacy bare catch syntax.
@@ -61,21 +63,31 @@ Tests will cover empty-body `Throwable` and `Exception` clauses, the existing qu
 **Files:**
 - No new files.
 
-- [ ] **Step 1: Run all repository tests**
+- [x] **Step 1: Run all repository tests**
   Run: `go test ./... -count=1`
   Expected: PASS.
 
-- [ ] **Step 2: Build a fresh `lg` binary**
+- [x] **Step 2: Build a fresh `lg` binary**
   Run: `make build`
   Expected: PASS and `/Users/andrew/Projects/let-go/lg` rebuilt from the current source.
 
-- [ ] **Step 3: Functionally probe tools.cli**
+- [x] **Step 3: Functionally probe tools.cli**
   Run: `LG_READ_CLJ=1 /Users/andrew/Projects/let-go/lg -source-paths "$HOME/.lgx/gitlibs/github.com/clojure/tools.cli/c24dbcb6c947a547c871f5450b3206517412564d/src/main/clojure" /Users/andrew/Projects/lgx/.tools-cli-probe.lg`
   Expected: no loader error; `parse-opts` returns `{:options {:port 8080 :verbose true}, :arguments ["input.txt"], ... :errors nil}`.
 
-- [ ] **Step 4: Record verification**
+- [x] **Step 4: Record verification**
   If the probe exposes another independent compatibility gap, stop and report it with a minimal repro. Otherwise mark this plan complete and resume the lgx example.
 
-- [ ] **Step 5: Commit the completed plan record**
+- [x] **Step 5: Commit the completed plan record**
   Run: `git add docs/plans/2026-07-10-simple-class-empty-catch.md && git commit -m "docs: complete simple-class catch plan"`
   Expected: the checked steps and completion summary are committed after final verification.
+
+## Completion Summary
+
+Implemented empty-body catch parsing for uppercase simple class symbols in both the bytecode compiler and native Go IR builder. Added regression coverage for `Throwable`, `Exception`, qualified classes, legacy bare catches, and native lowering. The full repository suite passes.
+
+The tools.cli probe progressed past catch compilation and exposed the next independent gap: `Exception.` rewrites to unresolved `->Exception`. Per the plan, that constructor compatibility work requires a separate plan.
+
+Deviations: Codex review identified the separate IR catch parser, so the implementation mirrored the rule in `pkg/rt/core/ir/build.lg` and added native-lowering tests. The follow-up Codex review could not run because the external account reached its usage limit.
+
+What the plan could have specified better: it should have identified the IR catch parser before implementation.
