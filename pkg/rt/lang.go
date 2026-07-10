@@ -5364,7 +5364,7 @@ func installLangNS() {
 		// the match string, capture groups yield [full g1 g2 ...].
 		all := re.FindAllStringSubmatch(string(s), -1)
 		if all == nil {
-			return vm.EmptyList, nil
+			return vm.NIL, nil
 		}
 		vals := make([]vm.Value, len(all))
 		for i, matches := range all {

@@ -23,5 +23,10 @@
            (re-seq #"(\d+)(\w)" "12W2B")))
     (is (= '(["ab" "a"]) (re-seq #"(a)b" "ab"))))
 
-  (testing "no match is empty"
-    (is (= () (re-seq #"(x)" "abc")))))
+  (testing "no match is nil and falsey"
+    (is (nil? (re-seq #"(x)" "abc")))
+    (is (= :long
+           (condp re-seq "--port"
+             #"^--$" :end
+             #"^--"  :long
+             :none)))))

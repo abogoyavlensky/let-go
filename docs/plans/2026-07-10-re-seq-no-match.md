@@ -26,10 +26,10 @@ The motivating verification will rebuild let-go, load `clojure.tools.cli` v1.4.2
 **Files:**
 - Modify: `test/shuffle_reseq_test.lg`
 
-- [ ] **Step 1: Correct the no-match expectation**
+- [x] **Step 1: Correct the no-match expectation**
   Replace the empty-list assertion with `nil?`. Add a `condp re-seq` case where `#"^--$"` does not match `"--port"` and `#"^--"` returns `:long`.
 
-- [ ] **Step 2: Run the focused test and verify failure**
+- [x] **Step 2: Run the focused test and verify failure**
   Run: `go test ./test -run 'TestRunner/shuffle_reseq_test.lg' -count=1 -v`
   Expected: FAIL because no-match returns `()` and the `condp` chooses the first clause.
 
@@ -39,18 +39,18 @@ The motivating verification will rebuild let-go, load `clojure.tools.cli` v1.4.2
 - Modify: `pkg/rt/lang.go`
 - Test: `test/shuffle_reseq_test.lg`
 
-- [ ] **Step 1: Return nil for no matches**
+- [x] **Step 1: Return nil for no matches**
   Change the `all == nil` branch in native `re-seq` from `vm.EmptyList` to `vm.NIL`.
 
-- [ ] **Step 2: Run the focused test**
+- [x] **Step 2: Run the focused test**
   Run: `go test ./test -run 'TestRunner/shuffle_reseq_test.lg' -count=1 -v`
   Expected: PASS.
 
-- [ ] **Step 3: Run runtime and core tests**
+- [x] **Step 3: Run runtime and core tests**
   Run: `go test ./pkg/rt ./test -count=1`
   Expected: PASS.
 
-- [ ] **Step 4: Commit the semantic fix**
+- [x] **Step 4: Commit the semantic fix**
   Run: `git add pkg/rt/lang.go test/shuffle_reseq_test.lg docs/plans/2026-07-10-re-seq-no-match.md && git commit -m "fix(rt): return nil when re-seq has no matches"`
   Expected: one focused implementation commit with checked task steps.
 
