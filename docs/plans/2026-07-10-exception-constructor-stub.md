@@ -26,10 +26,10 @@ Tests will define a function containing `(Exception. "boom")`, which proves comp
 **Files:**
 - Modify: `test/clojure_compat_aliases_test.lg`
 
-- [ ] **Step 1: Add a function that references `Exception.`**
+- [x] **Step 1: Add a function that references `Exception.`**
   Define a function whose body constructs `(Exception. "boom")`. Add a test that calls the function, catches the failure, and expects `Exception. is unavailable under let-go`.
 
-- [ ] **Step 2: Run the focused test and verify failure**
+- [x] **Step 2: Run the focused test and verify failure**
   Run: `go test ./test -run 'TestRunner/clojure_compat_aliases_test.lg' -count=1 -v`
   Expected: FAIL while compiling the test with `Can't resolve ->Exception in this context`.
 
@@ -39,18 +39,18 @@ Tests will define a function containing `(Exception. "boom")`, which proves comp
 - Modify: `pkg/rt/lang.go`
 - Test: `test/clojure_compat_aliases_test.lg`
 
-- [ ] **Step 1: Add the loud constructor stub**
+- [x] **Step 1: Add the loud constructor stub**
   Create one native function in `installClojureCompatAliases` that always returns `Exception. is unavailable under let-go`. Register it as both `Exception.` and `->Exception`.
 
-- [ ] **Step 2: Run the focused test**
+- [x] **Step 2: Run the focused test**
   Run: `go test ./test -run 'TestRunner/clojure_compat_aliases_test.lg' -count=1 -v`
   Expected: PASS.
 
-- [ ] **Step 3: Run runtime and core tests**
+- [x] **Step 3: Run runtime and core tests**
   Run: `go test ./pkg/rt ./test -count=1`
   Expected: PASS.
 
-- [ ] **Step 4: Commit the runtime fix**
+- [x] **Step 4: Commit the runtime fix**
   Run: `git add pkg/rt/lang.go test/clojure_compat_aliases_test.lg docs/plans/2026-07-10-exception-constructor-stub.md && git commit -m "fix(rt): add compile-only Exception constructor"`
   Expected: one focused commit with implementation, tests, and checked plan steps.
 
