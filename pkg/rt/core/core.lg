@@ -940,6 +940,9 @@
             map-sym (gensym "map__")
             new-bindings (conj pre '& rest-sym)
             ;; Build: (let [map-sym (seq-to-map-for-destructuring rest-sym) mdestr map-sym] body...)
+            ;; seq-to-map-for-destructuring returns nil for an empty/nil rest,
+            ;; so {:as o} binds to nil (not {}) when no kwargs were passed —
+            ;; matching Clojure — while also merging a Clojure 1.11 trailing map.
             let-binds (vector map-sym (list 'seq-to-map-for-destructuring rest-sym) mdestr map-sym)
             let-form (list* 'let let-binds body)]
         (fn-expand new-bindings (list let-form)))
